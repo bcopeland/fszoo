@@ -8,6 +8,8 @@
 
 #include "config.h"
 
+#define min(a,b) ((a)<(b)?(a):(b))
+#define max(a,b) ((a)>(b)?(a):(b))
 #define div_round(a,b) ((a)+(b)-1)/(b)
 
 struct ext2_info
@@ -38,13 +40,55 @@ u8 *bread_m(int blk_size, u64 blk, u64 count, FILE *fp)
     return mem;
 }
 
-u8 *ext2_get_block_n(struct ext2_info *info, struct ext2_inode *inode, int blk)
+u8 *ext2_get_block_n(struct ext2_info *info, struct ext2_inode *inode,
+                     int blknum)
 {
-    /* for now just direct blocks... */
-    if (blk >= EXT2_NDIR_BLOCKS)
-        return NULL;
+    u32 ptrs_per_block = info->block_size /  sizeof(u32);
+    u32 dptrs = ptrs_per_block * ptrs_per_block;
+    u32 ptrs[4];
+    int nptrs = 0;
+    int i;
 
-    return bread_m(info->block_size, inode->i_block[blk], 1, info->dev);
+    u8 *block = talloc_size(info, info->block_size);
+
+    /* build a list of blocks to read to reach the target block */
+    /* direct blocks */
+    if (blknum < EXT2_NDIR_BLOCKS)
+    {
+        ptrs[nptrs++] = blknum;
+    }
+    /* one indirection */
+    else if ( (blknum -= EXT2_NDIR_BLOCKS) < ptrs_per_block)
+    {
+        ptrs[nptrs++] = EXT2_IND_BLOCK;
+        ptrs[nptrs++] = blknum;
+    }
+    /* double indirection */
+    else if ( (blknum -= ptrs_per_block) < dptrs)
+    {
+        ptrs[nptrs++] = EXT2_DIND_BLOCK;
+        ptrs[nptrs++] = blknum / ptrs_per_block;
+        ptrs[nptrs++] = blknum % ptrs_per_block;
+    }
+    /* triple indirection */
+    else
+    {
+        blknum -= dptrs;
+        ptrs[nptrs++] = EXT2_TIND_BLOCK;
+        ptrs[nptrs++] = blknum / dptrs;
+        ptrs[nptrs++] = (blknum / ptrs_per_block) % ptrs_per_block;
+        ptrs[nptrs++] = blknum % ptrs_per_block;
+    }
+
+    blknum = inode->i_block[ptrs[0]];
+
+    for (i=1; i < nptrs; i++)
+    {
+        bread(block, info->block_size, blknum, info->dev);
+        blknum = ((u32 *) block)[ptrs[i]];
+    }
+    talloc_free(block);
+    return bread_m(info->block_size, blknum, 1, info->dev);
 }
 
 int ext2_read_inode(struct ext2_info *info, u32 ino, struct ext2_inode *ret)
@@ -224,19 +268,63 @@ static void ext2_readlink(fuse_req_t req, fuse_ino_t ino)
 static
 void ext2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    fuse_reply_err(req, EIO);
+    struct ext2_info *info = fuse_req_userdata(req);
+    struct ext2_inode *inode;
+
+    inode = talloc_size(info, sizeof(struct ext2_inode));
+
+    /* read the inode and store it in fi->fh */
+    if (ext2_read_inode(info, ino, inode))
+        fuse_reply_err(req, ENOENT);
+
+    fi->fh = (uint64_t) (unsigned long) inode;
+    fuse_reply_open(req, fi);
 }
 
 static void ext2_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                struct fuse_file_info *fi)
 {
+    struct ext2_info *info = fuse_req_userdata(req);
+    struct ext2_inode *inode = (struct ext2_inode *) (unsigned long) fi->fh;
+    u32 blk_start, blk_ofs;
+    int nblocks;
+    char *buf;
+    int bufsize = 0;
+    int i;
+
+    buf = talloc_size(info, size);
+    blk_start = off / info->block_size;
+    blk_ofs = off % info->block_size;
+
+    /* compute actual size to read */
+    size = min(size, inode->i_size - off);
+    nblocks = div_round(size + blk_ofs, info->block_size);
+
+    /* read all the associated blocks, and copy as space allows */
+    for (i=blk_start; i < blk_start + nblocks; i++)
+    {
+        u8 *block = ext2_get_block_n(info, inode, i);
+        if (!block)
+            goto out;
+
+        memcpy(buf + bufsize, block + blk_ofs, info->block_size - blk_ofs);
+        bufsize += info->block_size - blk_ofs;
+        blk_ofs = 0;
+    }
+    fuse_reply_buf(req, buf, bufsize);
+    return;
+
+out:
     fuse_reply_err(req, EIO);
 }
 
 static
 void ext2_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    fuse_reply_err(req, EIO);
+    struct ext2_inode *inode = (struct ext2_inode *) (unsigned long) fi->fh;
+
+    talloc_free(inode);
+    fuse_reply_err(req, 0);
 }
 
 static
@@ -358,20 +446,16 @@ static void ext2_statfs(fuse_req_t req, fuse_ino_t ino)
 static void ext2_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
                    size_t size)
 {
-    printf("extended %s\n", name);
-    fuse_reply_err(req, 0);
 }
 
 static void ext2_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 {
-    fuse_reply_err(req, EIO);
 }
 
 static void ext2_bmap(fuse_req_t req, fuse_ino_t ino, size_t blocksize,
                uint64_t idx)
 {
     /* fuse_reply_bmap(req, idx) */
-    fuse_reply_err(req, EIO);
 }
 
 static struct fuse_lowlevel_ops ext2_ops = {
@@ -385,9 +469,11 @@ static struct fuse_lowlevel_ops ext2_ops = {
     .readdir = ext2_readdir,
     .releasedir = ext2_releasedir,
     .statfs = ext2_statfs,
+/*
     .getxattr = ext2_getxattr,
     .listxattr = ext2_listxattr,
     .bmap = ext2_bmap
+*/
 };
 
 int main(int argc, char *argv[])
