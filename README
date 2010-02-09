@@ -1,0 +1,25 @@
+A Filesystem Zoo
+~~~~~~~~~~~~~~~~
+
+This is just some junk code that I have written to understand
+the disk layouts of various filesystems by implementing them
+read-only in FUSE.  Don't expect great things in terms of code
+style, performance, or correctness.  That said, the devices are
+opened read-only in user mode, so (probably) no harm can come
+from the programs.
+
+Synopsis
+--------
+
+$ ./ext2_fuse -a /dev/sda1 -f -d mnt
+$ fusermount -u mnt
+
+$ ./yaffs2_fuse -a system.img -f -d mnt
+$ fusermount -u mnt
+
+Bugs
+----
+- Multithread doesn't work due to conspicuous lack of locking
+- Nor do various types of links
+- YAFFS2 assumes certain MTD geometries that happen to match my phone
+
