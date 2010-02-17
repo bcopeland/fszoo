@@ -125,6 +125,21 @@ int yaffs2_read_inode(struct yaffs2_info *info, u32 ino,
     return 0;
 }
 
+struct yaffs2_inode *find_or_create_inode(struct yaffs2_info *info, u32 ino)
+{
+    struct yaffs2_inode *inode;
+
+    if (yaffs2_read_inode(info, ino, &inode) == 0)
+        return inode;
+
+    inode = talloc_zero_size(info, sizeof(*inode));
+    inode->object_id = ino;
+
+    /* hash the new inode */
+    g_hash_table_insert(info->object_map, &inode->object_id, inode);
+    return inode;
+}
+
 int yaffs2_read_super(struct yaffs2_info *info)
 {
     struct yaffs2_inode *root_dir, *inode, *parent;
@@ -172,32 +187,31 @@ int yaffs2_read_super(struct yaffs2_info *info)
 
             if (tags->sequence_number != ~0 && tags->chunk_id == 0)
             {
-                inode = talloc_zero_size(info, sizeof(*inode));
-                memcpy(&inode->header, object, sizeof(*object));
-                inode->object_id = tags->object_id;
+                inode = find_or_create_inode(info,
+                    le32_to_cpu(tags->object_id));
 
-                /* hash the new inode */
-                g_hash_table_insert(info->object_map, &inode->object_id,
-                    inode);
-
-                /* add to parent directory's list */
-                if (yaffs2_read_inode(info,
-                        inode->header.parent_object_id, &parent))
+                if (le32_to_cpu(tags->sequence_number) >
+                    inode->sequence_number)
                 {
-                    fprintf(stderr, "Directories are stored out of order."
-                           "I'm lazy and don't handle that yet.\n");
-                    res = -EIO;
-                    goto err;
+                    memcpy(&inode->header, object, sizeof(*object));
+                    inode->sequence_number =
+                        le32_to_cpu(tags->sequence_number);
+
+                    /* add to parent directory's list */
+                    parent = find_or_create_inode(info,
+                            inode->header.parent_object_id);
+                    parent->children = g_list_prepend(parent->children, inode);
                 }
-                parent->children = g_list_prepend(parent->children, inode);
+            }
+            else if (tags->chunk_id > 0)
+            {
+                /* create block nr tree */
             }
         }
     }
     talloc_free(buf);
 
-    res = 0;
-err:
-    return res;
+    return 0;
 }
 
 int yaffs2_stat(struct yaffs2_info *info, u32 ino, struct stat *st)

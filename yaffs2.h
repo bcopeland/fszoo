@@ -73,6 +73,7 @@ struct yaffs2_object_header {
 struct yaffs2_inode {
     struct yaffs2_object_header header;
     u32 object_id;
+    u32 sequence_number;
     GList *children;
 };
 
