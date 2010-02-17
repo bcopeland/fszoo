@@ -26,6 +26,12 @@
 #define YAFFS_MAX_ALIAS_LENGTH  159
 #define YAFFS_OBJECTID_ROOT     1
 
+#define YAFFS_LEAF_BITS    4
+#define YAFFS_LEAF_MASK  0xf
+
+#define YAFFS_INTERNAL_BITS    3
+#define YAFFS_INTERNAL_MASK  0x7
+
 enum object_type {
 	YAFFS_OBJECT_TYPE_UNKNOWN,
 	YAFFS_OBJECT_TYPE_FILE,
@@ -69,11 +75,26 @@ struct yaffs2_object_header {
     __le32 is_shrink;
 };
 
+struct yaffs2_tree
+{
+    union {
+        struct internal {
+            struct yaffs2_tree *ptrs[8];
+        } i;
+        struct leaf {
+            u32 phys[16];
+        } l;
+    } u;
+};
+
 /* In-memory structures */
 struct yaffs2_inode {
     struct yaffs2_object_header header;
     u32 object_id;
     u32 sequence_number;
+
     GList *children;
+    struct yaffs2_tree *block_tree;
+    int block_tree_height;
 };
 

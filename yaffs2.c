@@ -26,6 +26,8 @@ struct yaffs2_info
     int nblocks;
     int nchunks;
 
+    int block_size;
+
     /* object table, indexed by inode number */
     GHashTable *object_map;
 };
@@ -57,58 +59,32 @@ size_t device_get_size(FILE *fp)
     return end;
 }
 
-#if 0
 u8 *yaffs2_get_block_n(struct yaffs2_info *info, struct yaffs2_inode *inode,
-                     int blknum)
+                     int logical_block)
 {
-    u32 ptrs_per_block = info->block_size /  sizeof(u32);
-    u32 dptrs = ptrs_per_block * ptrs_per_block;
-    u32 ptrs[4];
-    int nptrs = 0;
+    int leaf_index = logical_block & YAFFS_LEAF_MASK;
+    int tree_index;
     int i;
+    struct yaffs2_tree *block_tree;
 
-    u8 *block = talloc_size(info, info->block_size);
+    block_tree = inode->block_tree;
+    for (i=inode->block_tree_height; i > 0; i--)
+    {
+        tree_index = (logical_block >> ((i-1) * YAFFS_INTERNAL_BITS +
+            YAFFS_LEAF_BITS)) & YAFFS_INTERNAL_MASK;
 
-    /* build a list of blocks to read to reach the target block */
-    /* direct blocks */
-    if (blknum < EXT2_NDIR_BLOCKS)
-    {
-        ptrs[nptrs++] = blknum;
-    }
-    /* one indirection */
-    else if ( (blknum -= EXT2_NDIR_BLOCKS) < ptrs_per_block)
-    {
-        ptrs[nptrs++] = EXT2_IND_BLOCK;
-        ptrs[nptrs++] = blknum;
-    }
-    /* double indirection */
-    else if ( (blknum -= ptrs_per_block) < dptrs)
-    {
-        ptrs[nptrs++] = EXT2_DIND_BLOCK;
-        ptrs[nptrs++] = blknum / ptrs_per_block;
-        ptrs[nptrs++] = blknum % ptrs_per_block;
-    }
-    /* triple indirection */
-    else
-    {
-        blknum -= dptrs;
-        ptrs[nptrs++] = EXT2_TIND_BLOCK;
-        ptrs[nptrs++] = blknum / dptrs;
-        ptrs[nptrs++] = (blknum / ptrs_per_block) % ptrs_per_block;
-        ptrs[nptrs++] = blknum % ptrs_per_block;
+        if (!block_tree->u.i.ptrs[tree_index])
+            return NULL;
+
+        block_tree = block_tree->u.i.ptrs[tree_index];
     }
 
-    blknum = inode->i_block[ptrs[0]];
+    printf("read block %x for file %x at %x\n", logical_block,
+        inode->object_id, block_tree->u.l.phys[leaf_index]);
 
-    for (i=1; i < nptrs; i++)
-    {
-        bread(block, info->block_size, blknum, info->dev);
-        blknum = ((u32 *) block)[ptrs[i]];
-    }
-    talloc_free(block);
-    return bread_m(info->block_size, blknum, 1, info->dev);
+    return bread_m(info->mtd_page + info->mtd_extra,
+        block_tree->u.l.phys[leaf_index], 1, info->dev);
 }
-#endif
 
 int yaffs2_read_inode(struct yaffs2_info *info, u32 ino,
                       struct yaffs2_inode **ret)
@@ -125,6 +101,53 @@ int yaffs2_read_inode(struct yaffs2_info *info, u32 ino,
     return 0;
 }
 
+void add_data_block(struct yaffs2_info *info, struct yaffs2_inode *inode,
+                    u32 logical_block, u32 physical_block)
+{
+    int leaf_index = logical_block & YAFFS_LEAF_MASK;
+    int tree_index = logical_block >> YAFFS_LEAF_BITS;
+    int height = 0;
+    struct yaffs2_tree *block_tree;
+    int i;
+
+    printf("block %x for file %x at %x\n", logical_block,
+        inode->object_id, physical_block);
+
+    /* see if the tree needs to grow */
+    while (tree_index)
+    {
+        height++;
+        tree_index >>= YAFFS_INTERNAL_BITS;
+    }
+
+    /* grow if needed */
+    while (inode->block_tree_height > height)
+    {
+        /* leave pointers null until there is data */
+        block_tree = talloc_zero_size(inode, sizeof(struct yaffs2_tree));
+        block_tree->u.i.ptrs[0] = inode->block_tree;
+
+        inode->block_tree = block_tree;
+        inode->block_tree_height++;
+    }
+
+    block_tree = inode->block_tree;
+    for (i=inode->block_tree_height; i > 0; i--)
+    {
+        tree_index = (logical_block >> ((i-1) * YAFFS_INTERNAL_BITS +
+            YAFFS_LEAF_BITS)) & YAFFS_INTERNAL_MASK;
+
+        if (!block_tree->u.i.ptrs[tree_index])
+        {
+            block_tree->u.i.ptrs[tree_index] = talloc_zero_size(inode,
+                sizeof(struct yaffs2_tree));
+        }
+        block_tree = block_tree->u.i.ptrs[tree_index];
+    }
+    /* at leaf, save physical pointer */
+    block_tree->u.l.phys[leaf_index] = physical_block;
+}
+
 struct yaffs2_inode *find_or_create_inode(struct yaffs2_info *info, u32 ino)
 {
     struct yaffs2_inode *inode;
@@ -134,6 +157,9 @@ struct yaffs2_inode *find_or_create_inode(struct yaffs2_info *info, u32 ino)
 
     inode = talloc_zero_size(info, sizeof(*inode));
     inode->object_id = ino;
+
+    /* FIXME only for files.. */
+    inode->block_tree = talloc_zero_size(info, sizeof(struct yaffs2_tree));
 
     /* hash the new inode */
     g_hash_table_insert(info->object_map, &inode->object_id, inode);
@@ -145,10 +171,10 @@ int yaffs2_read_super(struct yaffs2_info *info)
     struct yaffs2_inode *root_dir, *inode, *parent;
     struct yaffs2_object_header *object;
     struct yaffs2_tags *tags;
-    int res;
     int block, chunk;
     int devsize;
     char *buf;
+    int addr;
 
     info->object_map = g_hash_table_new(g_int_hash, g_int_equal);
 
@@ -157,6 +183,7 @@ int yaffs2_read_super(struct yaffs2_info *info)
     info->mtd_page = 2048;
     info->mtd_extra = 64;
     info->mtd_erase = 131072;
+    info->block_size = info->mtd_page + info->mtd_extra;
     info->chunks_per_block = info->mtd_erase / info->mtd_page;
 
     /*
@@ -205,7 +232,12 @@ int yaffs2_read_super(struct yaffs2_info *info)
             }
             else if (tags->chunk_id > 0)
             {
-                /* create block nr tree */
+                addr = block * info->chunks_per_block + chunk;
+
+                inode = find_or_create_inode(info,
+                    le32_to_cpu(tags->object_id));
+
+                add_data_block(info, inode, tags->chunk_id-1, addr);
             }
         }
     }
@@ -230,8 +262,8 @@ int yaffs2_stat(struct yaffs2_info *info, u32 ino, struct stat *st)
     st->st_atime = le32_to_cpu(inode->header.atime);
     st->st_mtime = le32_to_cpu(inode->header.mtime);
     st->st_ctime = le32_to_cpu(inode->header.ctime);
-#if 0
     st->st_blksize = info->block_size;
+#if 0
     st->st_blocks = le32_to_cpu(inode.i_blocks);
 #endif
     return 0;
@@ -309,7 +341,6 @@ void yaffs2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
     fuse_reply_open(req, fi);
 }
 
-#if 0
 static void yaffs2_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                struct fuse_file_info *fi)
 {
@@ -326,7 +357,7 @@ static void yaffs2_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     blk_ofs = off % info->block_size;
 
     /* compute actual size to read */
-    size = min(size, inode->i_size - off);
+    size = min(size, le32_to_cpu(inode->header.size) - off);
     nblocks = div_round(size + blk_ofs, info->block_size);
 
     /* read all the associated blocks, and copy as space allows */
@@ -355,7 +386,6 @@ void yaffs2_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
     talloc_free(inode);
     fuse_reply_err(req, 0);
 }
-#endif
 
 static
 void yaffs2_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
@@ -473,11 +503,11 @@ static struct fuse_lowlevel_ops yaffs2_ops = {
     .releasedir = yaffs2_releasedir,
     .statfs = yaffs2_statfs,
     .getattr = yaffs2_getattr,
-#if 0
-    .readlink = yaffs2_readlink,
     .open = yaffs2_open,
     .read = yaffs2_read,
     .release = yaffs2_release,
+#if 0
+    .readlink = yaffs2_readlink,
     .getxattr = yaffs2_getxattr,
     .listxattr = yaffs2_listxattr,
     .bmap = yaffs2_bmap
