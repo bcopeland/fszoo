@@ -110,9 +110,6 @@ void add_data_block(struct yaffs2_info *info, struct yaffs2_inode *inode,
     struct yaffs2_tree *block_tree;
     int i;
 
-    printf("block %x for file %x at %x\n", logical_block,
-        inode->object_id, physical_block);
-
     /* see if the tree needs to grow */
     while (tree_index)
     {
@@ -121,7 +118,7 @@ void add_data_block(struct yaffs2_info *info, struct yaffs2_inode *inode,
     }
 
     /* grow if needed */
-    while (inode->block_tree_height > height)
+    while (inode->block_tree_height < height)
     {
         /* leave pointers null until there is data */
         block_tree = talloc_zero_size(inode, sizeof(struct yaffs2_tree));
@@ -131,6 +128,7 @@ void add_data_block(struct yaffs2_info *info, struct yaffs2_inode *inode,
         inode->block_tree_height++;
     }
 
+    /* now search down the tree for the correct leaf */
     block_tree = inode->block_tree;
     for (i=inode->block_tree_height; i > 0; i--)
     {
@@ -166,6 +164,14 @@ struct yaffs2_inode *find_or_create_inode(struct yaffs2_info *info, u32 ino)
     return inode;
 }
 
+int inodes_equal(const void *i1, const void *i2)
+{
+    const struct yaffs2_inode *inode1 = i1;
+    const struct yaffs2_inode *inode2 = i2;
+
+    return inode1->object_id == inode2->object_id;
+}
+
 int yaffs2_read_super(struct yaffs2_info *info)
 {
     struct yaffs2_inode *root_dir, *inode, *parent;
@@ -176,7 +182,7 @@ int yaffs2_read_super(struct yaffs2_info *info)
     char *buf;
     int addr;
 
-    info->object_map = g_hash_table_new(g_int_hash, g_int_equal);
+    info->object_map = g_hash_table_new(g_int_hash, inodes_equal);
 
     devsize = device_get_size(info->dev);
 
